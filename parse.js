@@ -495,6 +495,26 @@ function skipCodeSpan(s, i, n) {
   return -1;
 }
 
+// Skip a code span inside a LINK LABEL, following marked's label regex
+// (`re`): `` `+(?!`)[^`]*?`+(?!`) `` -- the opener run, then content
+// with NO backtick, then a closer run of ANY length (no backreference:
+// the closer need not equal the opener). So `` `` a ` `` matches as a
+// span (content ` a `), but `` `` a ` b `` `` does NOT match as one span:
+// after `` `` a ` `` the leftover `` `` `` before ` in uses]` has no
+// closer, so the whole label fails and the link is rejected (doc-22).
+// Returns the index after the closer run, or -1 if there is no closer.
+function skipLabelCodeSpan(s, i, n) {
+  let j = i;
+  while (j < n && s[j] === '`') j++;
+  // Content: no backtick allowed; the closer is the FIRST backtick run.
+  let k = j;
+  while (k < n && s[k] !== '`') k++;
+  if (k >= n) return -1;
+  let e = k;
+  while (e < n && s[e] === '`') e++;
+  return e;
+}
+
 // Match a nested bracket pair [ ... ] whose content has no further
 // brackets (marked's `brackets` / Le). Returns the index after the
 // closing ] or -1.
@@ -523,8 +543,13 @@ function matchBracketGroup(s, i) {
     const c = s[j];
     if (c === '\\') { j += 2; continue; }
     if (c === '`') {
-      const end = skipCodeSpan(s, j, n);
+      const end = skipLabelCodeSpan(s, j, n);
       if (end !== -1) { j = end; continue; }
+      // No closer: the label survives only if the backtick run is
+      // immediately before the closing ] (`` ``+(?=\]) ``).
+      let k = j;
+      while (k < n && s[k] === '`') k++;
+      if (k < n && s[k] === ']') return k + 1;
       return -1;
     }
     if (c === '[') {
@@ -550,10 +575,14 @@ function findClosingBracket(s, start) {
     const c = s[i];
     if (c === '\\') { i += 2; continue; }
     if (c === '`') {
-      const end = skipCodeSpan(s, i, n);
+      const end = skipLabelCodeSpan(s, i, n);
       if (end !== -1) { i = end; continue; }
-      i++;
-      continue;
+      // No closer: the label survives only if the backtick run is
+      // immediately before the closing ] (`` ``+(?=\]) ``).
+      let k = i;
+      while (k < n && s[k] === '`') k++;
+      if (k < n && s[k] === ']') return k;
+      return -1;
     }
     if (c === '[') {
       const end = matchBracketGroup(s, i);
@@ -1079,6 +1108,16 @@ function inlineTo(s, refs, textMode, st) {
       if (tagEnd !== -1) {
         flushText(i);
         const tag = s.slice(i, tagEnd);
+        // marked's tag(): an opening `<a ` (note the required space,
+        // so `<a>` alone does not count) sets the document-level
+        // inLink, `</a>` clears it; the state persists across the
+        // whole document (the lexer state is never reset between
+        // blocks), so an unclosed `<a />` suppresses all later bare
+        // URLs (doc-06). Same for inRawBlock with pre/code/kbd/script.
+        if (!st.inLink && /^<a /i.test(tag)) st.inLink = true;
+        else if (st.inLink && /^<\/a>/i.test(tag)) st.inLink = false;
+        if (!st.inRawBlock && /^<(pre|code|kbd|script)(\s|>)/i.test(tag)) st.inRawBlock = true;
+        else if (st.inRawBlock && /^<\/(pre|code|kbd|script)(\s|>)/i.test(tag)) st.inRawBlock = false;
         out.push(textMode ? escAttr(tag) : tag);
         i = tagEnd;
         textStart = i;
@@ -1346,6 +1385,39 @@ function interruptsParagraph(lines, li, inList) {
   return false;
 }
 
+// True when the line is a valid fenced-code opener: up to 3 spaces,
+// 3+ backticks or tildes, and (for backticks) an info string with
+// no backtick. A lazy line cannot continue a fence opener (doc-17:
+// `` ```toml `` followed by an under-indented line ends the item
+// and leaves the fence empty, it does not merge into the info).
+function isFenceOpenerLine(line) {
+  let k = 0;
+  while (k < line.length && line[k] === ' ') k++;
+  if (k > 3) return false;
+  const ch = line[k];
+  if (ch !== '`' && ch !== '~') return false;
+  let flen = 0;
+  while (k + flen < line.length && line[k + flen] === ch) flen++;
+  if (flen < 3) return false;
+  if (ch === '`' && line.slice(k + flen).indexOf('`') !== -1) return false;
+  return true;
+}
+
+// Strip up to k columns of indent from a fenced-code content line.
+// Tabs advance to the next multiple of 4; a tab that starts before
+// the k boundary is consumed ENTIRELY even if it extends past k
+// (probe: fence indent 3, content `\tindented tab` -> `indented tab`,
+// not ` indented tab`). Spaces are stripped one column at a time.
+function stripFenceIndent(line, k) {
+  let col = 0, s = 0;
+  while (s < line.length && col < k) {
+    if (line[s] === ' ') { col++; s++; }
+    else if (line[s] === '\t') { col = (col + 4) & ~3; s++; }
+    else break;
+  }
+  return line.slice(s);
+}
+
 // True when the line is a thematic break (3+ of -, _, * with spaces).
 function isHr(line) {
   let k = 0;
@@ -1462,12 +1534,15 @@ function blockParse(lines, start, end, refs, out, isTop, inList) {
               let tag = '<pre><code';
               if (lang) tag += ' class="language-' + escAttr(lang) + '"';
               // Dedent content lines by the opening fence's indent
-              // (up to k spaces each).
-              for (let t = 0; t < code.length; t++) {
-                const cl2 = code[t];
-                let s = 0;
-                while (s < cl2.length && s < k && cl2[s] === ' ') s++;
-                if (s > 0) code[t] = cl2.slice(s);
+              // (up to k columns each; a tab split by the boundary
+              // is consumed whole -- stripFenceIndent). ONLY backtick
+              // fences dedent: marked does NOT dedent tilde-fence
+              // content (probe: `   ~~~ts` + `   aaa` -> `   aaa`,
+              // while backtick -> `aaa`; doc-22/29).
+              if (fenceCh === '`') {
+                for (let t = 0; t < code.length; t++) {
+                  code[t] = stripFenceIndent(code[t], k);
+                }
               }
               // For an unclosed fence, a trailing '' in code is the
               // split artifact of a trailing newline, not a line.
@@ -1702,7 +1777,7 @@ function blockParse(lines, start, end, refs, out, isTop, inList) {
                 const lastItemLine = itemLines.length > 0 ? itemLines[itemLines.length - 1] : null;
                 if (lastItemLine !== null && !isBlankLine(lastItemLine) &&
                     !isBlankLine(cl) && !interruptsParagraph(lines, j, inList) &&
-                    !matchListStart(cl)) {
+                    !matchListStart(cl) && !isFenceOpenerLine(lastItemLine)) {
                   // A lazy line keeps its leading whitespace verbatim
                   // when indented < 4 (`- one\n two` -> `one\n two`),
                   // but at indent >= 4 the 4-column indented-code
@@ -1813,11 +1888,11 @@ function blockParse(lines, start, end, refs, out, isTop, inList) {
 
 // Render one blockParse item to HTML. Called only after the whole block
 // pass is done, so every link reference definition is known.
-function renderItem(item, refs) {
+function renderItem(item, refs, state) {
   if (typeof item === 'string') return item;
   if (item.kind === 'blockquote') {
     let html = '<blockquote>\n';
-    for (const sub of item.inner) html += renderItem(sub, refs);
+    for (const sub of item.inner) html += renderItem(sub, refs, state);
     return html + '</blockquote>\n';
   }
   if (item.kind === 'list') {
@@ -1837,17 +1912,17 @@ function renderItem(item, refs) {
             const rest = sub.s.slice(tm[0].length);
             const box = checked ? '<input checked="" disabled="" type="checkbox">' :
               '<input disabled="" type="checkbox">';
-            if (!item.loose) html += box + ' ' + inlineTo(rest, refs, false);
-            else html += '<p>' + box + ' ' + inlineTo(rest, refs, false) + '</p>\n';
+            if (!item.loose) html += box + ' ' + inlineTo(rest, refs, false, state);
+            else html += '<p>' + box + ' ' + inlineTo(rest, refs, false, state) + '</p>\n';
             first = false;
             continue;
           }
         }
         first = false;
         if (!item.loose && typeof sub === 'object' && sub.pre === '<p>') {
-          html += inlineTo(sub.s, refs, false);
+          html += inlineTo(sub.s, refs, false, state);
         } else {
-          html += renderItem(sub, refs);
+          html += renderItem(sub, refs, state);
         }
       }
       html += '</li>\n';
@@ -1858,7 +1933,7 @@ function renderItem(item, refs) {
     let html = '<table>\n<thead>\n<tr>\n';
     for (let c = 0; c < item.headerCells.length; c++) {
       html += '<th' + (item.aligns[c] ? ' align="' + item.aligns[c] + '"' : '') + '>' +
-        inlineTo(item.headerCells[c].trim(), refs, false) + '</th>\n';
+        inlineTo(item.headerCells[c].trim(), refs, false, state) + '</th>\n';
     }
     html += '</tr>\n</thead>\n';
     if (item.body.length > 0) {
@@ -1869,7 +1944,7 @@ function renderItem(item, refs) {
         for (let c = 0; c < item.headerCells.length; c++) {
           const cell = c < cells.length ? cells[c] : '';
           html += '<td' + (item.aligns[c] ? ' align="' + item.aligns[c] + '"' : '') + '>' +
-            inlineTo(cell.trim(), refs, false) + '</td>\n';
+            inlineTo(cell.trim(), refs, false, state) + '</td>\n';
         }
         html += '</tr>\n';
       }
@@ -1877,7 +1952,7 @@ function renderItem(item, refs) {
     }
     return html + '</table>\n';
   }
-  return item.pre + inlineTo(item.s, refs, false) + item.post;
+  return item.pre + inlineTo(item.s, refs, false, state) + item.post;
 }
 
 // Match a list-item start on a line. Returns null, or an object with the
@@ -2102,21 +2177,25 @@ function matchSetext(lines, i, end, inList) {
 // Finish an html block. The raw text runs from line i to the start of the
 // next non-blank line after endLine (or EOF); ge() then strips trailing
 // blank lines, keeping at most one trailing newline.
-function finishHtmlBlock(lines, i, endLine, end, isTop) {
-  // The html block is lines[i..endLine]. It carries a trailing \n
-  // exactly when the next line exists and is not truly empty: a
-  // whitespace-only next line (e.g. doc-15's `\t` after `-->`)
-  // still counts (probe: `-->\n\t\nbar` -> `-->\n<p>bar</p>`),
-  // while a truly empty next line cancels it (`-->\n\nbar` ->
-  // `--><p>bar</p>`). A '' at the very end of the TOP-LEVEL range
-  // is the split artifact of a trailing newline (not a blank
-  // line), so it still gets a \n. (In a nested range the trailing
-  // '' is a synthetic separator, so it does not add a \n.)
+function finishHtmlBlock(lines, i, endLine, end, isTop, toBlank) {
+  // The html block is lines[i..endLine]. Trailing \n rule depends
+  // on the type. Types 1-5 end at a closing construct: a trailing
+  // \n is present exactly when the next line exists and is not
+  // truly empty -- a whitespace-only next line (e.g. doc-15's `\t`
+  // after `-->`) still counts (`-->\n\t\nbar` -> `-->\n<p>bar</p>`),
+  // while a truly empty next line cancels it. Types 6-7 run to a
+  // blank line: a trailing \n is present only when the next line
+  // is non-blank (`<div>..</div>\n\t\nbar` -> `</div><p>bar</p>`,
+  // doc-03). A '' at the very end of the TOP-LEVEL range is the
+  // split artifact of a trailing newline (not a blank line), so it
+  // still gets a \n. (In a nested range the trailing '' is a
+  // synthetic separator, so it does not add a \n.)
   let text = lines.slice(i, endLine + 1).join('\n');
   const ni = endLine + 1;
   if (ni < end) {
-    if (lines[ni] !== '') text += '\n';
-    else if (isTop && ni === end - 1) text += '\n';
+    const counts = toBlank ? !isBlankLine(lines[ni]) : lines[ni] !== '';
+    if (counts) text += '\n';
+    else if (isTop && ni === end - 1 && lines[ni] === '') text += '\n';
   }
   return { html: text, next: endLine + 1 };
 }
@@ -2187,7 +2266,7 @@ function matchHtmlBlock(lines, i, end, isTop) {
           after[0] === '>' || after.startsWith('/>')) {
         let endLine = i;
         while (endLine + 1 < end && !isBlankLine(lines[endLine + 1])) endLine++;
-        return finishHtmlBlock(lines, i, endLine, end, isTop);
+        return finishHtmlBlock(lines, i, endLine, end, isTop, true);
       }
     }
   }
@@ -2201,7 +2280,7 @@ function matchHtmlBlock(lines, i, end, isTop) {
       if (t === rest.length) {
         let endLine = i;
         while (endLine + 1 < end && !isBlankLine(lines[endLine + 1])) endLine++;
-        return finishHtmlBlock(lines, i, endLine, end, isTop);
+        return finishHtmlBlock(lines, i, endLine, end, isTop, true);
       }
     }
   }
@@ -2218,8 +2297,13 @@ export function parse(src) {
   const refs = new Map();
   const out = [];
   blockParse(lines, 0, lines.length, refs, out, true);
+  // Document-level inline state (marked's lexer state, created once
+  // per document and never reset between blocks): inLink/inRawBlock
+  // persist across the whole document (an unclosed `<a />` suppresses
+  // all later bare URLs). linkEmitted is managed by De save/restore.
+  const state = { inLink: false, inRawBlock: false, linkEmitted: false };
   let html = '';
-  for (const item of out) html += renderItem(item, refs);
+  for (const item of out) html += renderItem(item, refs, state);
   return html;
 }
 
