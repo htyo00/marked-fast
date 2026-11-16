@@ -560,10 +560,14 @@ function matchBracketGroup(s, i) {
       const end = skipLabelCodeSpan(s, j, n);
       if (end !== -1) { j = end; continue; }
       // No closer: the label survives only if the backtick run is
-      // immediately before the closing ] (`` ``+(?=\]) ``).
+      // immediately before the closing ] (`` ``+(?=\]) ``) -- which
+      // requires TWO or more backticks. A single lone backtick before
+      // ] cannot close the label (the single-char label atom excludes
+      // backtick), so `[x `a ` b`](...)` is not a link (doc-16/20/
+      // 23/35, cm-525 pattern).
       let k = j;
       while (k < n && s[k] === '`') k++;
-      if (k < n && s[k] === ']') return k + 1;
+      if (k - j >= 2 && k < n && s[k] === ']') return k + 1;
       return -1;
     }
     if (c === '[') {
@@ -592,10 +596,14 @@ function findClosingBracket(s, start) {
       const end = skipLabelCodeSpan(s, i, n);
       if (end !== -1) { i = end; continue; }
       // No closer: the label survives only if the backtick run is
-      // immediately before the closing ] (`` ``+(?=\]) ``).
+      // immediately before the closing ] (`` ``+(?=\]) ``) -- which
+      // requires TWO or more backticks. A single lone backtick before
+      // ] cannot close the label (the single-char label atom excludes
+      // backtick), so `[x `a ` b`](...)` is not a link (doc-16/20/
+      // 23/35, cm-525 pattern).
       let k = i;
       while (k < n && s[k] === '`') k++;
-      if (k < n && s[k] === ']') return k;
+      if (k - i >= 2 && k < n && s[k] === ']') return k;
       return -1;
     }
     if (c === '[') {
