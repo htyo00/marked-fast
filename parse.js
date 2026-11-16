@@ -938,6 +938,28 @@ function inlineTo(s, refs, textMode, st) {
       const opener = delims[d];
       if (opener === closer) continue;
       if (opener.c !== closer.c) continue;
+      // Blocked by a strong of the same char whose closer was followed
+      // by non-space text (the `*X **Y**Z*` rule: the outer * stays
+      // literal when the inner ** is followed by non-space).
+      if (opener.blocked) continue;
+      // A single `*` closer that cannot open, followed by a space,
+      // must not match a `**` opener -- but ONLY when a `**` closer
+      // actually follows later in the string (in `**a *b*other*
+      // option**` the stray `*` stays literal and the outer `**`
+      // forms a strong). With no `**` ahead (`**foo*`) the single
+      // `*` must still match one char of the `**` opener, forming
+      // `*<em>foo</em>`.
+      if (closer.c === '*' && closer.origN === 1 && !closer.open && opener.n === 2) {
+        const afterCloser = closer.idx + closer.origN < n ? s[closer.idx + closer.origN] : '\n';
+        if (afterCloser === ' ' || afterCloser === '\t' || afterCloser === '\n') {
+          // Look ahead for a `**` run that could close the opener.
+          let hasDoubleAhead = false;
+          for (let q = closer.idx + closer.origN; q + 1 < n; q++) {
+            if (s[q] === '*' && s[q + 1] === '*') { hasDoubleAhead = true; break; }
+          }
+          if (hasDoubleAhead) continue;
+        }
+      }
       if (!opener.open || !opener.active) continue;
       // Rule of 3: if either delimiter can both open and close, the sum
       // of the run lengths must not be a multiple of 3 unless both are.
@@ -987,6 +1009,31 @@ function inlineTo(s, refs, textMode, st) {
       // A _ opener that could also close is deactivated once it has been
       // used to open (it may not open again).
       if (opener.c === '_' && opener.close) opener.active = false;
+      // A strong whose closer is immediately followed by an alphanumeric
+      // character blocks any still-open delimiter of the same char that
+      // sits outside this span (`*X **Y**Z*`: the outer * stays literal
+      // because the inner ** is followed by Z, a letter). Punctuation
+      // or space after the ** does NOT block (`*a **b**, c*` forms).
+      // The block also requires the strong's OPENER to be preceded by
+      // a space: `*foo**bar**baz*` forms (the ** opener is intraword,
+      // preceded by a letter), while `*a **b**c*` does not.
+      // The closer's original run ends at closer.idx + closer.origN.
+      if (k === 2 && closer.c !== '~') {
+        const afterPos = closer.idx + closer.origN;
+        const after = afterPos < n ? s[afterPos] : '\n';
+        const beforeOpener = opener.idx > 0 ? s[opener.idx - 1] : '\n';
+        if (!isSpaceCh(after) && !isPunctCh(after) &&
+            (beforeOpener === ' ' || beforeOpener === '\t' || beforeOpener === '\n')) {
+          for (let d = 0; d < delims.length; d++) {
+            const od = delims[d];
+            // Rule of 3 against the inner ** closer (length 2): the
+            // outer opener is blocked only when (od.n + 2) % 3 === 0,
+            // i.e. od.n % 3 === 1. A ** outer (n=2) is NOT blocked
+            // (`**line **same**private**` forms the outer strong).
+            if (od.c === closer.c && od.open && od.idx < opener.idx && od.n % 3 === 1) od.blocked = true;
+          }
+        }
+      }
     }
     if (closer.n === 0) {
       const di = delims.indexOf(closer);
@@ -1172,7 +1219,7 @@ function inlineTo(s, refs, textMode, st) {
         continue;
       }
       flushText(i);
-      const delim = { c, n: len, open: canOpen, close: canClose, active: true };
+      const delim = { c, n: len, origN: len, idx: i, open: canOpen, close: canClose, active: true };
       out.push(delim);
       delims.push(delim);
       if (canClose) resolveCloser(delim);
@@ -1182,7 +1229,10 @@ function inlineTo(s, refs, textMode, st) {
     }
 
     // Bare URL / email. Try the scheme/www forms at this position, and an
-    // email when the char could start a local part.
+    // email when the char could start a local part. The scheme checks
+    // are direct charCode compares (no slice allocation, no regex);
+    // an email is only attempted when a '@' actually follows in the
+    // current word, so plain words never pay for matchBareUrl.
     if (c === 'h' || c === 'f' || c === 'w' || c === 'm' || c === 'x' ||
         isEmailLocalCh(s.charCodeAt(i))) {
       const prevCh = i > 0 ? s[i - 1] : undefined;
@@ -1191,32 +1241,61 @@ function inlineTo(s, refs, textMode, st) {
       // local part starts here); for www., the lookbehind is checked
       // inside matchBareUrl; scheme URLs may start anywhere.
       const prevIsLocal = prevCh !== undefined && isEmailLocalCh(prevCh.charCodeAt(0));
-      // Scheme start, case-insensitive (Https://, MAILTO:, ...).
+      // Scheme start, case-insensitive (Https://, MAILTO:, ...),
+      // via charCode compares: `| 32` folds ASCII letters to lowercase.
+      // Only computed when this char could start a scheme (h/f/m/x).
       const cl = c.toLowerCase();
-      const isSchemeStart = (cl === 'h' && /^(?:https?):\/\//i.test(s.slice(i, i + 8))) ||
-        (cl === 'f' && /^ftp:\/\//i.test(s.slice(i, i + 6))) ||
-        (cl === 'm' && /^mailto:/i.test(s.slice(i, i + 7))) ||
-        (cl === 'x' && /^xmpp:/i.test(s.slice(i, i + 5)));
-      if (!st.inLink && (isSchemeStart || (c === 'w' && s.startsWith('www.', i)) || !prevIsLocal)) {
-        // An '_' emphasis opener is currently open: a trailing '_' run
-        // after an email domain may be its closing delimiter.
-        let hasUnderscoreOpener = false;
-        for (let d = 0; d < delims.length; d++) {
-          const dd = delims[d];
-          if (dd.c === '_' && dd.open && dd.active) { hasUnderscoreOpener = true; break; }
+      let isSchemeStart = false;
+      if (cl === 'h' || cl === 'f' || cl === 'm' || cl === 'x') {
+        const c0 = s.charCodeAt(i) | 32;
+        const c1 = i + 1 < n ? s.charCodeAt(i + 1) | 32 : 0;
+        const c2 = i + 2 < n ? s.charCodeAt(i + 2) | 32 : 0;
+        const c3 = i + 3 < n ? s.charCodeAt(i + 3) | 32 : 0;
+        const c4 = i + 4 < n ? s.charCodeAt(i + 4) | 32 : 0;
+        const c5 = i + 5 < n ? s.charCodeAt(i + 5) | 32 : 0;
+        const c6 = i + 6 < n ? s.charCodeAt(i + 6) | 32 : 0;
+        const isHttp = c0 === 104 && c1 === 116 && c2 === 116 && c3 === 112 &&
+          ((c4 === 58 && c5 === 47 && c6 === 47) ||
+           (c4 === 115 && i + 7 < n && (s.charCodeAt(i + 5) | 32) === 58 &&
+            s.charCodeAt(i + 6) === 47 && s.charCodeAt(i + 7) === 47));
+        const isFtp = c0 === 102 && c1 === 116 && c2 === 112 && c3 === 58 &&
+          c4 === 47 && c5 === 47;
+        const isMailto = c0 === 109 && c1 === 97 && c2 === 105 && c3 === 108 &&
+          c4 === 116 && c5 === 111 && c6 === 58;
+        const isXmpp = c0 === 120 && c1 === 109 && c2 === 112 && c3 === 112 && c4 === 58;
+        isSchemeStart = isHttp || isFtp || isMailto || isXmpp;
+      }
+      const isWww = c === 'w' && s.startsWith('www.', i);
+      if (!st.inLink && (isSchemeStart || isWww || !prevIsLocal)) {
+        // Email pre-scan: only attempt matchBareUrl when a '@' follows
+        // in the current word (for scheme/www the call is made anyway).
+        let hasAt = isSchemeStart || isWww;
+        if (!hasAt) {
+          let j = i;
+          while (j < n && isEmailLocalCh(s.charCodeAt(j))) j++;
+          hasAt = j < n && s[j] === '@';
         }
-        const bare = matchBareUrl(s, i, n, prevCh, hasUnderscoreOpener);
-        if (bare) {
-          flushText(i);
-          if (textMode) {
-            out.push(escText(bare.text));
-          } else {
-            const href = escAttr(cleanUrl(bare.href) ?? bare.href);
-            out.push('<a href="' + href + '">' + escText(bare.text) + '</a>');
+        if (hasAt) {
+          // An '_' emphasis opener is currently open: a trailing '_' run
+          // after an email domain may be its closing delimiter.
+          let hasUnderscoreOpener = false;
+          for (let d = 0; d < delims.length; d++) {
+            const dd = delims[d];
+            if (dd.c === '_' && dd.open && dd.active) { hasUnderscoreOpener = true; break; }
           }
-          i = bare.end;
-          textStart = i;
-          continue;
+          const bare = matchBareUrl(s, i, n, prevCh, hasUnderscoreOpener);
+          if (bare) {
+            flushText(i);
+            if (textMode) {
+              out.push(escText(bare.text));
+            } else {
+              const href = escAttr(cleanUrl(bare.href) ?? bare.href);
+              out.push('<a href="' + href + '">' + escText(bare.text) + '</a>');
+            }
+            i = bare.end;
+            textStart = i;
+            continue;
+          }
         }
       }
       i++;
@@ -1229,13 +1308,12 @@ function inlineTo(s, refs, textMode, st) {
   flushText(n);
   // Render the output: strings stay, delimiter objects become their literal
   // remaining characters.
-  let result = '';
+  const parts = [];
   for (let k = 0; k < out.length; k++) {
     const item = out[k];
-    if (typeof item === 'string') result += item;
-    else result += item.c.repeat(item.n);
+    parts.push(typeof item === 'string' ? item : item.c.repeat(item.n));
   }
-  return result;
+  return parts.join('');
 }
 
 // ---------------------------------------------------------------------------
@@ -1987,16 +2065,17 @@ function blockParse(lines, start, end, refs, out, isTop, inList) {
 function renderItem(item, refs, state) {
   if (typeof item === 'string') return item;
   if (item.kind === 'blockquote') {
-    let html = '<blockquote>\n';
-    for (const sub of item.inner) html += renderItem(sub, refs, state);
-    return html + '</blockquote>\n';
+    const parts = ['<blockquote>\n'];
+    for (const sub of item.inner) parts.push(renderItem(sub, refs, state));
+    parts.push('</blockquote>\n');
+    return parts.join('');
   }
   if (item.kind === 'list') {
-    let html = item.ordered ? '<ol' : '<ul';
-    if (item.ordered && item.startNum !== 1) html += ' start="' + item.startNum + '"';
-    html += '>\n';
+    const parts = [item.ordered ? '<ol' : '<ul'];
+    if (item.ordered && item.startNum !== 1) parts.push(' start="' + item.startNum + '"');
+    parts.push('>\n');
     for (const inner of item.items) {
-      html += '<li>';
+      parts.push('<li>');
       let first = true;
       for (const sub of inner) {
         // Task list item: a leading [ ] / [x] / [X] in the first
@@ -2008,45 +2087,47 @@ function renderItem(item, refs, state) {
             const rest = sub.s.slice(tm[0].length);
             const box = checked ? '<input checked="" disabled="" type="checkbox">' :
               '<input disabled="" type="checkbox">';
-            if (!item.loose) html += box + ' ' + inlineTo(rest, refs, false, state);
-            else html += '<p>' + box + ' ' + inlineTo(rest, refs, false, state) + '</p>\n';
+            if (!item.loose) parts.push(box + ' ' + inlineTo(rest, refs, false, state));
+            else parts.push('<p>' + box + ' ' + inlineTo(rest, refs, false, state) + '</p>\n');
             first = false;
             continue;
           }
         }
         first = false;
         if (!item.loose && typeof sub === 'object' && sub.pre === '<p>') {
-          html += inlineTo(sub.s, refs, false, state);
+          parts.push(inlineTo(sub.s, refs, false, state));
         } else {
-          html += renderItem(sub, refs, state);
+          parts.push(renderItem(sub, refs, state));
         }
       }
-      html += '</li>\n';
+      parts.push('</li>\n');
     }
-    return html + (item.ordered ? '</ol>\n' : '</ul>\n');
+    parts.push(item.ordered ? '</ol>\n' : '</ul>\n');
+    return parts.join('');
   }
   if (item.kind === 'table') {
-    let html = '<table>\n<thead>\n<tr>\n';
+    const parts = ['<table>\n<thead>\n<tr>\n'];
     for (let c = 0; c < item.headerCells.length; c++) {
-      html += '<th' + (item.aligns[c] ? ' align="' + item.aligns[c] + '"' : '') + '>' +
-        inlineTo(item.headerCells[c].trim(), refs, false, state) + '</th>\n';
+      parts.push('<th' + (item.aligns[c] ? ' align="' + item.aligns[c] + '"' : '') + '>' +
+        inlineTo(item.headerCells[c].trim(), refs, false, state) + '</th>\n');
     }
-    html += '</tr>\n</thead>\n';
+    parts.push('</tr>\n</thead>\n');
     if (item.body.length > 0) {
-      html += '<tbody>';
+      parts.push('<tbody>');
       for (const row of item.body) {
         const cells = splitTableRow(row);
-        html += '<tr>\n';
+        parts.push('<tr>\n');
         for (let c = 0; c < item.headerCells.length; c++) {
           const cell = c < cells.length ? cells[c] : '';
-          html += '<td' + (item.aligns[c] ? ' align="' + item.aligns[c] + '"' : '') + '>' +
-            inlineTo(cell.trim(), refs, false, state) + '</td>\n';
+          parts.push('<td' + (item.aligns[c] ? ' align="' + item.aligns[c] + '"' : '') + '>' +
+            inlineTo(cell.trim(), refs, false, state) + '</td>\n');
         }
-        html += '</tr>\n';
+        parts.push('</tr>\n');
       }
-      html += '</tbody>';
+      parts.push('</tbody>');
     }
-    return html + '</table>\n';
+    parts.push('</table>\n');
+    return parts.join('');
   }
   return item.pre + inlineTo(item.s, refs, false, state) + item.post;
 }
