@@ -914,6 +914,305 @@ function flanking(s, i, len) {
   return { left, right };
 }
 
+// Unicode letter-or-digit (marked's unicodeAlphaNumeric).
+const ALPHANUM_RE = /[\p{L}\p{N}]/u;
+function isAlphaNumCh(ch) {
+  return ALPHANUM_RE.test(ch);
+}
+
+// ---------------------------------------------------------------------------
+// Marked-faithful emphasis / strikethrough (mask + closer scan)
+// ---------------------------------------------------------------------------
+// A delimiter stack resolves eagerly and cannot reproduce marked's scan
+// order: the closer search runs on a masked string, in text order, with
+// a debt counter. These helpers implement marked's emStrong / del
+// algorithms from their rules. A length-preserving mask hides code
+// spans, escapes, links and html tags, so delimiters inside them cannot
+// pair with delimiters outside.
+
+// Mask, step 1 (marked's anyPunctuationOutsideCode): a code span keeps
+// its backticks but inner backticks become '+'; a backslash-escaped
+// punctuation char becomes '+'s; a bare backtick run is unchanged.
+const MASK_CODE_RE = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
+// Mask, step 2 (marked's blockSkip): an inline link, a code span, or an
+// html tag becomes '[aaa...]' (same length). The link alternative only
+// needs the syntactic shape [...](...); validity is matchLink's job.
+const MASK_BLOCK_RE = /\[(?:[^\[\]`]|(?<a>`+)[^`]+\k<a>(?!`))*?\]\((?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*\)|(?<!`)(?<b>`+)[^`]+\k<b>(?!`)|<(?! )[^<>]*?>/g;
+
+// Does this text contain a link (marked's linkInText)? An inline link
+// (containsInlineLink) or a valid reference link whose label does not
+// itself contain a link (recursively).
+function labelHasLink(text, refs) {
+  if (!text.includes('[')) return false;
+  if (containsInlineLink(text)) return true;
+  const n = text.length;
+  for (let i = 0; i < n; i++) {
+    if (text[i] !== '[') continue;
+    const link = matchLink(text, i, refs, false);
+    if (!link) continue;
+    const close = findClosingBracket(text, i);
+    if (close === -1) continue;
+    const after = close + 1;
+    // Inline link: already covered by containsInlineLink.
+    if (after < n && text[after] === '(') continue;
+    // A reflink counts only when its label does not itself contain a link.
+    if (labelHasLink(link.text, refs)) continue;
+    return true;
+  }
+  return false;
+}
+
+// Reflink mask (marked's reflinkSearch): a valid reference link is
+// replaced by '[aaa...]' (same length) so delimiters inside its label
+// cannot pair with delimiters outside it. Only links whose ref is
+// defined in `refs` are masked. The scan uses matchLink, so validity
+// (label rules, ref resolution) matches the link parser exactly.
+// When a full/collapsed ref's label itself contains a link, only the
+// ref part is masked and the label is masked recursively (marked's
+// linkInText branch); otherwise the whole match is masked. Inline
+// links are NOT masked here (blockSkip does that).
+function maskReflinks(s, refs) {
+  const n = s.length;
+  let out = '';
+  let pos = 0;
+  let i = 0;
+  while (i < n) {
+    const c = s[i];
+    if (c !== '[' && !(c === '!' && i + 1 < n && s[i + 1] === '[')) { i++; continue; }
+    const isImage = c === '!';
+    const bracket = isImage ? i + 1 : i;
+    const link = matchLink(s, bracket, refs, isImage);
+    if (!link) { i++; continue; }
+    const close = findClosingBracket(s, bracket);
+    if (close === -1) { i++; continue; }
+    const after = close + 1;
+    // Inline link (destination follows the label): masked by blockSkip.
+    if (after < n && s[after] === '(' && link.end > after) { i++; continue; }
+    if (!isImage && after < n && s[after] === '[' && labelHasLink(link.text, refs)) {
+      const maskedLabel = maskReflinks(link.text, refs);
+      const refLen = link.end - after;
+      out += s.slice(pos, i) + '[' + maskedLabel + '][' + 'a'.repeat(refLen - 2) + ']';
+    } else {
+      out += s.slice(pos, i) + '[' + 'a'.repeat(link.end - i - 2) + ']';
+    }
+    pos = link.end;
+    i = link.end;
+  }
+  out += s.slice(pos);
+  return out;
+}
+
+function maskInline(s, refs) {
+  const step0 = maskReflinks(s, refs);
+  const step1 = step0.replace(MASK_CODE_RE, (m, open, esc) => {
+    if (esc) return '+'.repeat(m.length);
+    if (open) return open + m.slice(open.length, -open.length).replace(/`/g, '+') + open;
+    return m;
+  });
+  return step1.replace(MASK_BLOCK_RE, (m) => '[' + 'a'.repeat(m.length - 2) + ']');
+}
+
+// Last run start of ch in the masked string whose preceding char is not
+// whitespace (marked's fe); -1 when there is none. A run at index 0
+// never counts (its "preceding char" is a newline).
+function lastCloserIndex(t, ch) {
+  let last = -1;
+  const n = t.length;
+  for (let s = 0; s < n;) {
+    if (t[s] !== ch) { s++; continue; }
+    const before = s === 0 ? '\n' : t[s - 1];
+    let e = s + 1;
+    while (e < n && t[e] === ch) e++;
+    if (before !== ' ' && before !== '\t' && before !== '\n' &&
+        before !== '\r' && before !== '\f') last = s;
+    s = e;
+  }
+  return last;
+}
+
+// Class tests for the closer scan. For '*' (GFM) a '~' counts as a
+// letter (notPunctSpace), not as punctuation; for '_' and '~' it counts
+// as punctuation (the plain classes).
+function scanPunct(ch, c) { return isPunctCh(ch) && (c !== '*' || ch !== '~'); }
+function scanPunctSpace(ch, c) {
+  return (isSpaceCh(ch) || isPunctCh(ch)) && (c !== '*' || ch !== '~');
+}
+function scanNotPunctSpace(ch, c) {
+  return (!isSpaceCh(ch) && !isPunctCh(ch)) || (c === '*' && ch === '~');
+}
+
+// Classify one delimiter run by its neighbours in the masked string
+// (the RDelim groups). b = char before the run, a = char after the
+// matched portion of the run ('' at end of string), c = delimiter.
+// Returns 1..6, or 0 when no group matches (not a closer candidate).
+// g1 before punct, after space/end; g2 before notPunctSpace, after
+// punctSpace/end; g3 before punctSpace, after notPunctSpace; g4 before
+// space, after punct; g5 before punct, after punct; g6 before
+// notPunctSpace, after notPunctSpace. NOTE: the '_' RDelim has NO g6
+// (an intra-word '_' run is never a closer), so g6 only applies to
+// '*' and '~'.
+function classifyRun(b, a, c) {
+  const bPunct = scanPunct(b, c);
+  const bSpace = isSpaceCh(b);
+  const bPunctSpace = scanPunctSpace(b, c);
+  const bNot = scanNotPunctSpace(b, c);
+  const aEnd = a === '';
+  const aSpace = !aEnd && isSpaceCh(a);
+  const aPunct = !aEnd && scanPunct(a, c);
+  const aPunctSpace = !aEnd && scanPunctSpace(a, c);
+  const aNot = !aEnd && scanNotPunctSpace(a, c);
+  if (bPunct && (aSpace || aEnd)) return 1;
+  if (bNot && (aPunctSpace || aEnd)) return 2;
+  if (bPunctSpace && aNot) return 3;
+  if (bSpace && aPunct) return 4;
+  if (bPunct && aPunct) return 5;
+  if (c !== '_' && bNot && aNot) return 6;
+  return 0;
+}
+
+// Try marked's emStrong at a delimiter run (char c, length len, start i)
+// in s, using the masked string t. Returns null, or
+// {end, textStart, textEnd, strong}: the raw span is s[i..end) and the
+// inner text (recursed into) is s[textStart..textEnd).
+function tryEmStrong(s, t, i, len, c) {
+  const n = s.length;
+  const afterCh = i + len < n ? s[i + len] : '';
+  // l: start of the maximal delimiter run containing this opener in the
+  // masked string (marked extends back over the same char). p: char
+  // before the whole run. When this opener is a sub-run (l < i), the
+  // prev char for the checks below is p, not the char right before i
+  // (so `x__bar__` stays literal: the run is intra-word as a whole).
+  let l = i;
+  while (l > 0 && t[l - 1] === c) l--;
+  const p = l > 0 ? t[l - 1] : '';
+  let prevCh = i > 0 ? s[i - 1] : '';
+  if (l < i) prevCh = p;
+  // LDelim: a following non-space char is required.
+  if (!afterCh || isSpaceCh(afterCh)) return null;
+  // '_' intra-word rule: after is alphanumeric and prev is alphanumeric.
+  if (c === '_' && isAlphaNumCh(afterCh) && prevCh && isAlphaNumCh(prevCh)) return null;
+  // d: punctuation right after the run (GFM punct excludes '~').
+  const d = afterCh && isPunctCh(afterCh) && afterCh !== '~' ? afterCh : '';
+  // h: char before the run is space or punctuation.
+  const h = p !== '' && (isSpaceCh(p) || isPunctCh(p));
+  // u: prev char is space or punctuation (not * or _); when this is a
+  // sub-run, u is h.
+  const u = l < i ? h : (prevCh !== '' && (isSpaceCh(prevCh) ||
+    (isPunctCh(prevCh) && prevCh !== '*' && prevCh !== '_')));
+  // Gate: no attempt when after is punct and prev is a letter/digit
+  // (or the other delimiter char).
+  if (d && prevCh && !u) return null;
+  const k = len;
+  const y = i - l + k;
+  const R = p !== '' && !isSpaceCh(p) && (d !== '' || (c === '*' && !h));
+  const o = prevCh === c;
+  const v = lastCloserIndex(t, c);
+  const Q = i + k;
+  if (v < Q) return null;
+  const ts = t.slice(Q);
+  const ee = v - Q;
+  let m = k, f = 0;
+  // First alternative: skip a __...*...__ (or **..._...**) region at the
+  // start of the search text; a delimiter inside it cannot close this.
+  let scanStart = 0;
+  if (c === '*') {
+    const skip = /^[^_*]*?__[^_*]*?\*[^_*]*?(?=__)/.exec(ts);
+    if (skip) scanStart = skip[0].length;
+  } else {
+    const skip = /^[^_*]*?\*\*[^_*]*?_[^_*]*?(?=\*\*)/.exec(ts);
+    if (skip) scanStart = skip[0].length;
+  }
+  // Scan delimiter runs in text order (indexOf jumps over plain text).
+  let rs = scanStart;
+  while (rs < ts.length) {
+    const next = ts.indexOf(c, rs);
+    if (next === -1) break;
+    let rl = 0;
+    while (next + rl < ts.length && ts[next + rl] === c) rl++;
+    // The match starts at the leading char (next-1); stop past the limit.
+    if (next - 1 > ee) break;
+    // A run at the very start of the search text has no leading char
+    // in it, so no RDelim alternative can match it.
+    if (next === 0) { rs = next + rl; continue; }
+    const g = classifyRun(ts[next - 1], next + rl < ts.length ? ts[next + rl] : '', c);
+    rs = next + rl;
+    if (g === 0) continue;
+    const b = rl;
+    if (g === 3 || g === 4) { m += b; continue; }
+    if (g === 5 || g === 6 || R) {
+      if (o && (g === 5 || g === 6)) return null;
+      if (y % 3 !== 0 && (y + b) % 3 === 0) { f += b; continue; }
+    }
+    m -= b;
+    if (m > 0) continue;
+    const used = Math.min(b, b + m + f);
+    const runAbs = Q + next;
+    const rawEnd = runAbs + used;
+    const strong = Math.min(k, used) % 2 === 0;
+    return {
+      end: rawEnd,
+      textStart: i + (strong ? 2 : 1),
+      textEnd: rawEnd - (strong ? 2 : 1),
+      strong,
+    };
+  }
+  return null;
+}
+
+// Try marked's del at a '~' run (length len, start i) in s, using the
+// masked string t. Returns null, or {end, textStart, textEnd}. The
+// closer run must be exactly the opener's length (a single '~' cannot
+// close '~~').
+function tryDel(s, t, i, len) {
+  const n = s.length;
+  const afterCh = i + len < n ? s[i + len] : '';
+  const prevCh = i > 0 ? s[i - 1] : '';
+  // delLDelim: a following non-space, non-'~' char is required.
+  if (!afterCh || isSpaceCh(afterCh) || afterCh === '~') return null;
+  // Gate: no attempt when after is punct and prev is a letter/digit
+  // (or the other delimiter char).
+  const afterPunct = isPunctCh(afterCh);
+  const prevIsPunctSpace = prevCh !== '' && (isSpaceCh(prevCh) || isPunctCh(prevCh)) &&
+    prevCh !== '*' && prevCh !== '_';
+  if (afterPunct && prevCh && !prevIsPunctSpace) return null;
+  const o = len;
+  const u = lastCloserIndex(t, '~');
+  const Q = i + o;
+  if (u < Q) return null;
+  const ts = t.slice(Q);
+  const ee = u - Q;
+  let p = o;
+  let rs = 0;
+  while (rs < ts.length) {
+    const next = ts.indexOf('~', rs);
+    if (next === -1) break;
+    let rl = 0;
+    while (next + rl < ts.length && ts[next + rl] === '~') rl++;
+    if (next - 1 > ee) break;
+    if (next === 0) { rs = next + rl; continue; }
+    // The (~~?) group takes at most 2; a run longer than 2 can never
+    // match: the char after the matched portion is '~', which fails
+    // the (?!~) lookaheads of g2/g4/g5 and the notPunctSpace lookahead
+    // of g1/g3/g6. Skip such runs outright.
+    if (rl > 2) { rs = next + rl; continue; }
+    const effLen = Math.min(rl, 2);
+    const a = next + rl < ts.length ? ts[next + rl] : '';
+    const g = classifyRun(ts[next - 1], a, '~');
+    rs = next + rl;
+    if (g === 0) continue;
+    if (effLen !== o) continue;
+    const b = effLen;
+    if (g === 3 || g === 4) { p += b; continue; }
+    p -= b;
+    if (p > 0) continue;
+    const used = Math.min(b, b + p);
+    const runAbs = Q + next;
+    const rawEnd = runAbs + used;
+    return { end: rawEnd, textStart: i + o, textEnd: rawEnd - o };
+  }
+  return null;
+}
+
 // Render an inline string to HTML (or to plain text when textMode is true,
 // for image alt text). `refs` maps normalized labels to {href, title}.
 // `st` tracks whether a link was emitted (marked's linkEmitted): a link
@@ -923,122 +1222,19 @@ function inlineTo(s, refs, textMode, st) {
   if (!st) st = { linkEmitted: false };
   const n = s.length;
   const out = [];
-  const delims = [];
   let i = 0;
   let textStart = 0;
+  // Lazily built masked string (only computed when a delimiter run is
+  // found, and cached for the whole inline string).
+  let masked = null;
+  const getMasked = () => {
+    if (masked === null) masked = maskInline(s, refs);
+    return masked;
+  };
 
   const flushText = (end) => {
     if (end > textStart) out.push(escText(s.slice(textStart, end)));
     textStart = end;
-  };
-
-  // Find the closest matching opener for `closer` in the delimiter stack.
-  const findOpener = (closer) => {
-    for (let d = delims.length - 1; d >= 0; d--) {
-      const opener = delims[d];
-      if (opener === closer) continue;
-      if (opener.c !== closer.c) continue;
-      // Blocked by a strong of the same char whose closer was followed
-      // by non-space text (the `*X **Y**Z*` rule: the outer * stays
-      // literal when the inner ** is followed by non-space).
-      if (opener.blocked) continue;
-      // A single `*` closer that cannot open, followed by a space,
-      // must not match a `**` opener -- but ONLY when a `**` closer
-      // actually follows later in the string (in `**a *b*other*
-      // option**` the stray `*` stays literal and the outer `**`
-      // forms a strong). With no `**` ahead (`**foo*`) the single
-      // `*` must still match one char of the `**` opener, forming
-      // `*<em>foo</em>`.
-      if (closer.c === '*' && closer.origN === 1 && !closer.open && opener.n === 2) {
-        const afterCloser = closer.idx + closer.origN < n ? s[closer.idx + closer.origN] : '\n';
-        if (afterCloser === ' ' || afterCloser === '\t' || afterCloser === '\n') {
-          // Look ahead for a `**` run that could close the opener.
-          let hasDoubleAhead = false;
-          for (let q = closer.idx + closer.origN; q + 1 < n; q++) {
-            if (s[q] === '*' && s[q + 1] === '*') { hasDoubleAhead = true; break; }
-          }
-          if (hasDoubleAhead) continue;
-        }
-      }
-      if (!opener.open || !opener.active) continue;
-      // Rule of 3: if either delimiter can both open and close, the sum
-      // of the run lengths must not be a multiple of 3 unless both are.
-      {
-        const openerBoth = opener.open && opener.close;
-        const closerBoth = closer.open && closer.close;
-        if (openerBoth || closerBoth) {
-          const sum = opener.n + closer.n;
-          if (sum % 3 === 0 && (opener.n % 3 !== 0 || closer.n % 3 !== 0)) continue;
-        }
-      }
-      return { opener, index: d };
-    }
-    return null;
-  };
-
-  // Try to resolve `closer` against openers in the stack, using up its
-  // characters. Inserts the tags into `out` around the matched span.
-  const resolveCloser = (closer) => {
-    while (closer.n > 0) {
-      const found = findOpener(closer);
-      if (!found) break;
-      const { opener, index } = found;
-      const k = Math.min(opener.n, closer.n, 2);
-      let openTag, closeTag;
-      if (opener.c === '~') { openTag = '<del>'; closeTag = '</del>'; }
-      else if (k === 2) { openTag = '<strong>'; closeTag = '</strong>'; }
-      else { openTag = '<em>'; closeTag = '</em>'; }
-      if (textMode) { openTag = ''; closeTag = ''; }
-      const oi = out.indexOf(opener);
-      const ci = out.indexOf(closer);
-      // Delimiters stranded inside the span just formed can no longer
-      // match a closer outside it (they would cross the span boundary).
-      const stranded = delims.filter((d) => {
-        const di = out.indexOf(d);
-        return di > oi && di < ci;
-      });
-      if (openTag) out.splice(oi + 1, 0, openTag);
-      if (closeTag) out.splice(ci + 1, 0, closeTag);
-      for (const d of stranded) {
-        const di = delims.indexOf(d);
-        if (di !== -1) delims.splice(di, 1);
-      }
-      opener.n -= k;
-      closer.n -= k;
-      if (opener.n === 0) delims.splice(index, 1);
-      // A _ opener that could also close is deactivated once it has been
-      // used to open (it may not open again).
-      if (opener.c === '_' && opener.close) opener.active = false;
-      // A strong whose closer is immediately followed by an alphanumeric
-      // character blocks any still-open delimiter of the same char that
-      // sits outside this span (`*X **Y**Z*`: the outer * stays literal
-      // because the inner ** is followed by Z, a letter). Punctuation
-      // or space after the ** does NOT block (`*a **b**, c*` forms).
-      // The block also requires the strong's OPENER to be preceded by
-      // a space: `*foo**bar**baz*` forms (the ** opener is intraword,
-      // preceded by a letter), while `*a **b**c*` does not.
-      // The closer's original run ends at closer.idx + closer.origN.
-      if (k === 2 && closer.c !== '~') {
-        const afterPos = closer.idx + closer.origN;
-        const after = afterPos < n ? s[afterPos] : '\n';
-        const beforeOpener = opener.idx > 0 ? s[opener.idx - 1] : '\n';
-        if (!isSpaceCh(after) && !isPunctCh(after) &&
-            (beforeOpener === ' ' || beforeOpener === '\t' || beforeOpener === '\n')) {
-          for (let d = 0; d < delims.length; d++) {
-            const od = delims[d];
-            // Rule of 3 against the inner ** closer (length 2): the
-            // outer opener is blocked only when (od.n + 2) % 3 === 0,
-            // i.e. od.n % 3 === 1. A ** outer (n=2) is NOT blocked
-            // (`**line **same**private**` forms the outer strong).
-            if (od.c === closer.c && od.open && od.idx < opener.idx && od.n % 3 === 1) od.blocked = true;
-          }
-        }
-      }
-    }
-    if (closer.n === 0) {
-      const di = delims.indexOf(closer);
-      if (di !== -1) delims.splice(di, 1);
-    }
   };
 
   while (i < n) {
@@ -1196,35 +1392,44 @@ function inlineTo(s, refs, textMode, st) {
       continue;
     }
 
-    // Delimiter run: *, _, ~.
+    // Delimiter run: *, _, ~. Marked's emStrong / del scan the masked
+    // string for a closer at the opener's position and recurse into
+    // the span text. When no span forms, only ONE char is consumed:
+    // marked's text rule stops before the next delimiter, so the next
+    // char of the run is retried as its own opener (`**foo*` forms
+    // `*<em>foo</em>`, `~~~foo~~` forms `~<del>foo</del>`).
     if (c === '*' || c === '_' || c === '~') {
       let len = 0;
       while (i + len < n && s[i + len] === c) len++;
-      // A ~ run longer than 2 is not a delimiter at all.
-      if (c === '~' && len > 2) {
-        i += len;
-        continue;
-      }
       const { left, right } = flanking(s, i, len);
-      let canOpen, canClose;
+      let canOpen;
       if (c === '_') {
         canOpen = left && (!right || isPunctCh(i > 0 ? s[i - 1] : '\n'));
-        canClose = right && (!left || isPunctCh(i + len < n ? s[i + len] : '\n'));
       } else {
         canOpen = left;
-        canClose = right;
       }
-      if (!canOpen && !canClose) {
-        i += len;
-        continue;
+      if (canOpen && !(c === '~' && len > 2)) {
+        const span = c === '~' ? tryDel(s, getMasked(), i, len) :
+          tryEmStrong(s, getMasked(), i, len, c);
+        if (span) {
+          flushText(i);
+          const inner = inlineTo(s.slice(span.textStart, span.textEnd), refs, textMode, st);
+          if (textMode) {
+            out.push(inner);
+          } else if (c === '~') {
+            out.push('<del>' + inner + '</del>');
+          } else if (span.strong) {
+            out.push('<strong>' + inner + '</strong>');
+          } else {
+            out.push('<em>' + inner + '</em>');
+          }
+          i = span.end;
+          textStart = i;
+          continue;
+        }
       }
-      flushText(i);
-      const delim = { c, n: len, origN: len, idx: i, open: canOpen, close: canClose, active: true };
-      out.push(delim);
-      delims.push(delim);
-      if (canClose) resolveCloser(delim);
-      i += len;
-      textStart = i;
+      // No span formed: one literal char; the rest of the run is retried.
+      i++;
       continue;
     }
 
@@ -1276,14 +1481,11 @@ function inlineTo(s, refs, textMode, st) {
           hasAt = j < n && s[j] === '@';
         }
         if (hasAt) {
-          // An '_' emphasis opener is currently open: a trailing '_' run
-          // after an email domain may be its closing delimiter.
-          let hasUnderscoreOpener = false;
-          for (let d = 0; d < delims.length; d++) {
-            const dd = delims[d];
-            if (dd.c === '_' && dd.open && dd.active) { hasUnderscoreOpener = true; break; }
-          }
-          const bare = matchBareUrl(s, i, n, prevCh, hasUnderscoreOpener);
+          // An '_' opener is resolved by emStrong before the email is
+          // scanned (it either pairs and the email sits inside the span
+          // text, or it does not pair and the trailing '_' is literal),
+          // so a trailing '_' run never lets the email backtrack.
+          const bare = matchBareUrl(s, i, n, prevCh, false);
           if (bare) {
             flushText(i);
             if (textMode) {
@@ -1306,14 +1508,7 @@ function inlineTo(s, refs, textMode, st) {
   }
 
   flushText(n);
-  // Render the output: strings stay, delimiter objects become their literal
-  // remaining characters.
-  const parts = [];
-  for (let k = 0; k < out.length; k++) {
-    const item = out[k];
-    parts.push(typeof item === 'string' ? item : item.c.repeat(item.n));
-  }
-  return parts.join('');
+  return out.join('');
 }
 
 // ---------------------------------------------------------------------------
