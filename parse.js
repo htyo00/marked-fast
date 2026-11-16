@@ -1645,6 +1645,34 @@ function isHtmlBlockStart(line) {
   return false;
 }
 
+// A complete type-7 HTML tag line: up to 3 spaces, a single tag, then
+// only whitespace. Uses matchTag so the tag validity matches
+// matchHtmlBlock's type-7 branch exactly. Excludes type 1
+// (script/pre/style/textarea) and type 6 (block tags), and comments/
+// PIs — those are already handled by isHtmlBlockStart, so a type-7
+// check must not swallow them (</div> ends the list item, it is not
+// merged into it). (The N3 case: </span>, <span>, </script>, ...)
+function isType7TagLine(line) {
+  let k = 0;
+  while (k < line.length && line[k] === ' ') k++;
+  if (k > 3 || line[k] !== '<') return false;
+  const rest = line.slice(k);
+  const te = matchTag(rest, 0, rest.length);
+  if (te <= 0) return false;
+  let t = te;
+  while (t < rest.length && (rest[t] === ' ' || rest[t] === '\t')) t++;
+  if (t !== rest.length) return false;
+  const m = /^<(\/?)([A-Za-z][A-Za-z0-9-]*)/.exec(rest);
+  if (!m) return false;
+  const name = m[2].toLowerCase();
+  // Type 1 is OPENING script/pre/style/textarea only; a closing tag
+  // of those names is type 7. Type 6 (block tags) covers both open
+  // and close.
+  if (m[1] !== '/' && (name === 'script' || name === 'pre' || name === 'style' || name === 'textarea')) return false;
+  if (BLOCK_TAGS.has(name)) return false;
+  return true;
+}
+
 // Does the line at index `li` start a table (header line + delimiter line)?
 // This is the raw table regex, without the cell-count check: the paragraph
 // interruption test uses it.
@@ -2130,6 +2158,27 @@ function blockParse(lines, start, end, refs, out, isTop, inList) {
               // a list item is not lazy.)
               {
                 const lastItemLine = itemLines.length > 0 ? itemLines[itemLines.length - 1] : null;
+                // N3: a lazy continuation line that is a complete
+                // type-7 HTML tag line is NOT merged into the
+                // paragraph — it becomes its own line in the item, so
+                // blockParse renders it as an html block (dropping
+                // the newline before it). It stays inside the item.
+                if (lastItemLine !== null && !isBlankLine(lastItemLine) &&
+                    !isBlankLine(cl) && isType7TagLine(cl)) {
+                  itemLines.push(cl);
+                  j++;
+                  continue;
+                }
+                // A line after a type-7 tag line does not merge into
+                // it either — the tag line is an html block, and the
+                // following line belongs to that block (blockParse
+                // extends it to a blank line), not to the paragraph.
+                if (lastItemLine !== null && !isBlankLine(lastItemLine) &&
+                    !isBlankLine(cl) && isType7TagLine(lastItemLine)) {
+                  itemLines.push(cl);
+                  j++;
+                  continue;
+                }
                 if (lastItemLine !== null && !isBlankLine(lastItemLine) &&
                     !isBlankLine(cl) && !interruptsParagraph(lines, j, inList) &&
                     !matchListStart(cl) && !isFenceOpenerLine(lastItemLine)) {
@@ -2264,6 +2313,13 @@ function blockParse(lines, start, end, refs, out, isTop, inList) {
         const l = lines[j];
         if (isBlankLine(l)) break;
         if (j > i && interruptsParagraph(lines, j, inList)) break;
+        // N3: inside a list item, a continuation line that is a
+        // complete type-7 HTML tag line ends the paragraph (marked
+        // renders it as an html block, dropping the newline before
+        // it). The next iteration picks it up via matchHtmlBlock.
+        // Top-level paragraphs keep the tag inline (the newline is
+        // kept), so this is list-only.
+        if (j > i && inList && isType7TagLine(l)) break;
         // Inside a list item, a continuation line indented by 4+
         // columns loses exactly 4 (marked's paragraph text: the
         // list already stripped the content indent, and the inner
@@ -2579,8 +2635,11 @@ function matchSetext(lines, i, end, inList) {
         return { text, level, next: j + 1 };
       }
     }
-    // Otherwise it must be a plain text line: no block start, no 4+ indent.
-    if (indentOf(l) >= 4) return null;
+    // Otherwise it must be a plain text line: no block start, and no
+    // 4+ indent on the FIRST line (an indented line after the first is
+    // a lazy continuation — indented code cannot interrupt a paragraph
+    // — so it is kept verbatim). This is the N2 fix.
+    if (textLines.length === 0 && indentOf(l) >= 4) return null;
     if (j > i && interruptsParagraph(lines, j, inList)) return null;
     textLines.push(l);
     j++;
