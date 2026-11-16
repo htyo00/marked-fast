@@ -967,6 +967,9 @@ function labelHasLink(text, refs) {
 // cannot pair with delimiters outside it. Only links whose ref is
 // defined in `refs` are masked. The scan uses matchLink, so validity
 // (label rules, ref resolution) matches the link parser exactly.
+// The scan jumps from '[' to '[' with indexOf (a '[' preceded by '!' is
+// an image; if the image match fails the link match fails too, since the
+// image check is strictly more permissive, so no retry is needed).
 // When a full/collapsed ref's label itself contains a link, only the
 // ref part is masked and the label is masked recursively (marked's
 // linkInText branch); otherwise the whole match is masked. Inline
@@ -975,47 +978,54 @@ function maskReflinks(s, refs) {
   const n = s.length;
   let out = '';
   let pos = 0;
-  let i = 0;
-  while (i < n) {
-    const c = s[i];
-    if (c !== '[' && !(c === '!' && i + 1 < n && s[i + 1] === '[')) { i++; continue; }
-    const isImage = c === '!';
-    const bracket = isImage ? i + 1 : i;
-    const link = matchLink(s, bracket, refs, isImage);
-    if (!link) { i++; continue; }
-    const close = findClosingBracket(s, bracket);
-    if (close === -1) { i++; continue; }
+  let i = s.indexOf('[', 0);
+  while (i !== -1) {
+    const isImage = i > 0 && s[i - 1] === '!';
+    const start = isImage ? i - 1 : i;
+    const link = matchLink(s, i, refs, isImage);
+    if (!link) { i = s.indexOf('[', i + 1); continue; }
+    const close = findClosingBracket(s, i);
+    if (close === -1) { i = s.indexOf('[', i + 1); continue; }
     const after = close + 1;
     // Inline link (destination follows the label): masked by blockSkip.
-    if (after < n && s[after] === '(' && link.end > after) { i++; continue; }
+    if (after < n && s[after] === '(' && link.end > after) { i = s.indexOf('[', i + 1); continue; }
     if (!isImage && after < n && s[after] === '[' && labelHasLink(link.text, refs)) {
       const maskedLabel = maskReflinks(link.text, refs);
       const refLen = link.end - after;
-      out += s.slice(pos, i) + '[' + maskedLabel + '][' + 'a'.repeat(refLen - 2) + ']';
+      out += s.slice(pos, start) + '[' + maskedLabel + '][' + 'a'.repeat(refLen - 2) + ']';
     } else {
-      out += s.slice(pos, i) + '[' + 'a'.repeat(link.end - i - 2) + ']';
+      out += s.slice(pos, start) + '[' + 'a'.repeat(link.end - start - 2) + ']';
     }
     pos = link.end;
-    i = link.end;
+    i = s.indexOf('[', link.end);
   }
   out += s.slice(pos);
   return out;
 }
 
 function maskInline(s, refs) {
-  const step0 = maskReflinks(s, refs);
-  const step1 = step0.replace(MASK_CODE_RE, (m, open, esc) => {
-    if (esc) return '+'.repeat(m.length);
-    if (open) return open + m.slice(open.length, -open.length).replace(/`/g, '+') + open;
-    return m;
-  });
-  return step1.replace(MASK_BLOCK_RE, (m) => '[' + 'a'.repeat(m.length - 2) + ']');
+  const step0 = s.includes('[') ? maskReflinks(s, refs) : s;
+  // The code mask only matches backticks or escapes; the block mask only
+  // matches links, code spans or html tags. Skip a pass when the string
+  // cannot contain a match (a plain-text paragraph pays nothing).
+  const step1 = step0.includes('`') || step0.includes('\\') ?
+    step0.replace(MASK_CODE_RE, (m, open, esc) => {
+      if (esc) return '+'.repeat(m.length);
+      if (open) return open + m.slice(open.length, -open.length).replace(/`/g, '+') + open;
+      return m;
+    }) : step0;
+  return (step1.includes('[') || step1.includes('<') || step1.includes('`')) ?
+    step1.replace(MASK_BLOCK_RE, (m) => '[' + 'a'.repeat(m.length - 2) + ']') : step1;
 }
 
 // Last run start of ch in the masked string whose preceding char is not
 // whitespace (marked's fe); -1 when there is none. A run at index 0
-// never counts (its "preceding char" is a newline).
+// never counts (its "preceding char" is a newline). Single-entry cache:
+// the masked string is the same for every opener in one inline span,
+// so consecutive calls reuse the scan.
+let lastCloserCache = { t: null, ch: '', v: -1 };
 function lastCloserIndex(t, ch) {
+  if (lastCloserCache.t === t && lastCloserCache.ch === ch) return lastCloserCache.v;
   let last = -1;
   const n = t.length;
   for (let s = 0; s < n;) {
@@ -1027,6 +1037,7 @@ function lastCloserIndex(t, ch) {
         before !== '\r' && before !== '\f') last = s;
     s = e;
   }
+  lastCloserCache = { t, ch, v: last };
   return last;
 }
 
@@ -1218,6 +1229,34 @@ function tryDel(s, t, i, len) {
 // `st` tracks whether a link was emitted (marked's linkEmitted): a link
 // whose text itself emits a link is rejected, so the flag is saved and
 // restored around each link-text parse.
+// Next position >= from where an inline token could start: a special
+// char, a scheme/www start, or '@' (email marker). Used by the
+// plain-text fast path in inlineTo.
+const NEXT_STOP_RE = /[\\`\n\[<!*_~]|[hH][tT][tT][pP][sS]?:\/\/|[fF][tT][pP]:\/\/|[mM][aA][iI][lL][tT][oO]:|[xX][mM][pP][pP]:|www\.|@/g;
+function nextStop(s, from) {
+  NEXT_STOP_RE.lastIndex = from;
+  const m = NEXT_STOP_RE.exec(s);
+  return m ? m.index : s.length;
+}
+
+// Jump to the next token start at or after `from`. An '@' stop
+// backtracks to its word start (the email local-part start), unless
+// that word starts before `from` (already checked) — then the
+// '@' is skipped and the search continues.
+function jumpToStop(s, from) {
+  let stop = nextStop(s, from);
+  while (stop < s.length && s[stop] === '@') {
+    let start = stop;
+    while (start > 0 && isEmailLocalCh(s.charCodeAt(start - 1))) start--;
+    if (start < from) {
+      stop = nextStop(s, stop + 1);
+    } else {
+      return start;
+    }
+  }
+  return stop;
+}
+
 function inlineTo(s, refs, textMode, st) {
   if (!st) st = { linkEmitted: false };
   const n = s.length;
@@ -1500,11 +1539,14 @@ function inlineTo(s, refs, textMode, st) {
           }
         }
       }
-      i++;
+      // Plain-text run: jump to the next token start instead of
+      // advancing one char (the URL check above already failed here).
+      i = jumpToStop(s, i + 1);
       continue;
     }
 
-    i++;
+    // Plain-text run: jump to the next token start.
+    i = jumpToStop(s, i + 1);
   }
 
   flushText(n);
