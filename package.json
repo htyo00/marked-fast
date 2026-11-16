@@ -1,1 +1,1 @@
-{"description":"Fast single-pass Markdown renderer, byte-identical to marked 18.1.3 with default options","exports":{".":"./parse.js"},"license":"MIT","main":"parse.js","name":"marked-fast","private":true,"type":"module","version":"1.0.0"}
+{"description":"Dependency-free Markdown renderer, byte-identical to marked 18.1.3, tuned for speed.","exports":{".":"./parse.js"},"keywords":["markdown","marked","renderer"],"license":"MIT","main":"parse.js","name":"marked-fast","type":"module","version":"3.0.0"}
