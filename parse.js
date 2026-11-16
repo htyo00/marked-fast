@@ -502,10 +502,24 @@ function skipCodeSpan(s, i, n) {
 // span (content ` a `), but `` `` a ` b `` `` does NOT match as one span:
 // after `` `` a ` `` the leftover `` `` `` before ` in uses]` has no
 // closer, so the whole label fails and the link is rejected (doc-22).
-// Returns the index after the closer run, or -1 if there is no closer.
+// A backtick run immediately before a ] that closes the label is NOT a
+// code-span opener: marked's label regex has the `` ``+(?=\]) ``
+// alternative, and its non-greedy star prefers the shorter label, so
+// `[less `` a ` b ``](./docs/value.md)` closes at the first ] instead
+// of spanning a huge code span to the ` of `a_b` (doc-33). Returns the
+// index after the closer run, or -1 if there is no closer.
 function skipLabelCodeSpan(s, i, n) {
   let j = i;
   while (j < n && s[j] === '`') j++;
+  // A run of 2+ backticks immediately before a ] that closes the label
+  // (followed by an inline `(` destination) is NOT a code span opener:
+  // marked's label regex has the `` ``+(?=\]) `` alternative (2+
+  // backticks), and its non-greedy star prefers the shorter label, so
+  // `[less `` a ` b ``](./docs/value.md)` closes at the first ] instead
+  // of spanning a huge code span to the ` of `a_b` (doc-33). A single
+  // backtick before ] (cm-525: `[foo`](/uri)`) does NOT match that
+  // alternative, so the code span `` `](/uri)` `` still forms.
+  if (j - i >= 2 && j < n && s[j] === ']' && s[j + 1] === '(') return -1;
   // Content: no backtick allowed; the closer is the FIRST backtick run.
   let k = j;
   while (k < n && s[k] !== '`') k++;
