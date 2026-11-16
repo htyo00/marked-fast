@@ -105,7 +105,12 @@ function isEmailDomainCh(code) {
 // Try to match a bare email starting at i. Returns the end index (exclusive)
 // or -1. The email must have a dot in the domain, the last domain label must
 // end with an alphanumeric, and the char after must not be a word char or '-'.
-function matchEmail(s, i, n) {
+// `allowTrailingUnderscore`: true when an '_' emphasis opener is
+// currently open in the inline delimiter stack, so a trailing '_' run
+// after the domain may be that span's closing delimiter (and the email
+// ends before it). Without an open '_', a trailing '_' is literal text
+// and the email must not match (gfm-632: `a.b-c_d@a.b_` stays plain).
+function matchEmail(s, i, n, allowTrailingUnderscore) {
   let j = i;
   while (j < n && isEmailLocalCh(s.charCodeAt(j))) j++;
   if (j === i || j >= n || s[j] !== '@') return -1;
@@ -133,7 +138,26 @@ function matchEmail(s, i, n) {
     } else break;
   }
   if (dots < 1) return -1;
-  if (lastAlnum !== k - 1) return -1;
+  if (lastAlnum !== k - 1) {
+    // The domain scan consumed trailing '_' chars. Those are the
+    // closing emphasis delimiter of a span the email sits inside
+    // (`__...because@mark.example.com__`): marked extracts the span
+    // text first, so the email never sees the '__'. Backtrack to the
+    // last alnum and accept the email when the '_' run is followed by
+    // a non-word char (i.e. it cannot be part of a longer domain).
+    if (lastAlnum < 0) return -1;
+    if (!allowTrailingUnderscore) return -1;
+    const bk = lastAlnum + 1;
+    let r = bk;
+    while (r < n && s.charCodeAt(r) === 95) r++;
+    if (r === bk) return -1;
+    if (r < n) {
+      const c = s.charCodeAt(r);
+      if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
+          c === 95 || c === 45) return -1;
+    }
+    return bk;
+  }
   // The char after must not be a word char or '-'.
   if (k < n) {
     const c = s.charCodeAt(k);
@@ -192,12 +216,13 @@ function backpedalUrl(u) {
 // Returns {href, text, end} or null. `prevCh` is the char before i (for the
 // www. lookbehind: the char before www. must be whitespace, *, _, ~, ( or
 // start-of-string).
-function matchBareUrl(s, i, n, prevCh) {
-  // mailto: / xmpp: + email
-  if (s.startsWith('mailto:', i) || s.startsWith('xmpp:', i)) {
-    const isXmpp = s.startsWith('xmpp:', i);
+function matchBareUrl(s, i, n, prevCh, allowTrailingUnderscore) {
+  // mailto: / xmpp: + email (scheme case-insensitive).
+  const head7 = s.slice(i, i + 7).toLowerCase();
+  if (head7 === 'mailto:' || head7.slice(0, 5) === 'xmpp:') {
+    const isXmpp = head7.slice(0, 5) === 'xmpp:';
     const schemeLen = isXmpp ? 5 : 7;
-    const e = matchEmail(s, i + schemeLen, n);
+    const e = matchEmail(s, i + schemeLen, n, allowTrailingUnderscore);
     if (e !== -1) {
       let end = e;
       // xmpp: may have one /resource suffix: /[A-Za-z0-9@.]+
@@ -216,13 +241,11 @@ function matchBareUrl(s, i, n, prevCh) {
     }
     return null;
   }
-  // scheme:// URLs (http, https, ftp) -- no lookbehind.
+  // scheme:// URLs (http, https, ftp) -- no lookbehind. The scheme is
+  // case-insensitive in the GFM url regex, so any mix (Https://, hTTp://)
+  // counts (doc-01/doc-12).
   let schemeEnd = -1;
-  if (s.startsWith('http://', i)) schemeEnd = i + 7;
-  else if (s.startsWith('https://', i)) schemeEnd = i + 8;
-  else if (s.startsWith('ftp://', i)) schemeEnd = i + 6;
-  else if (s.startsWith('HTTP://', i) || s.startsWith('HTTPS://', i) || s.startsWith('FTP://', i)) {
-    // Scheme is case-insensitive in the url regex ([hH][tT][tT][pP][sS]?).
+  {
     const m = /^(?:https?|ftp):\/\//i.exec(s.slice(i, i + 8));
     if (m) schemeEnd = i + m[0].length;
   }
@@ -254,7 +277,7 @@ function matchBareUrl(s, i, n, prevCh) {
     return { href: 'http://' + raw, text: raw, end: i + raw.length };
   }
   // Bare email.
-  const e = matchEmail(s, i, n);
+  const e = matchEmail(s, i, n, allowTrailingUnderscore);
   if (e !== -1) {
     const text = s.slice(i, e);
     return { href: 'mailto:' + text, text, end: e };
@@ -990,12 +1013,17 @@ function inlineTo(s, refs, textMode, st) {
       if (link) {
         // Parse the link text with a fresh linkEmitted flag. If the text
         // itself emits a link, the outer link is rejected (marked's De).
+        // While parsing the text, inLink is set: bare URLs and autolinks
+        // inside link text are plain text, not links (doc-12).
         // In textMode (alt text) the inner text is plain text too.
         const saved = st.linkEmitted;
+        const savedInLink = st.inLink;
         st.linkEmitted = false;
+        st.inLink = true;
         const inner = inlineTo(link.text, refs, textMode || isImage, st);
         const emitted = st.linkEmitted;
         st.linkEmitted = saved;
+        st.inLink = savedInLink;
         if (!isImage && emitted) {
           // Nested link: the '[' is literal text; keep scanning.
           i++;
@@ -1030,7 +1058,9 @@ function inlineTo(s, refs, textMode, st) {
       continue;
     }
 
-    // Autolink <...> or inline HTML tag.
+    // Autolink <...> or inline HTML tag. Angle-bracket autolinks are
+    // NOT suppressed inside link text (marked renders them nested,
+    // doc-12); only bare URLs are suppressed by inLink.
     if (c === '<') {
       const auto = matchAutolink(s, i, n);
       if (auto) {
@@ -1100,12 +1130,21 @@ function inlineTo(s, refs, textMode, st) {
       // local part starts here); for www., the lookbehind is checked
       // inside matchBareUrl; scheme URLs may start anywhere.
       const prevIsLocal = prevCh !== undefined && isEmailLocalCh(prevCh.charCodeAt(0));
-      const isSchemeStart = (c === 'h' && (s.startsWith('http://', i) || s.startsWith('https://', i))) ||
-        (c === 'f' && s.startsWith('ftp://', i)) ||
-        (c === 'm' && s.startsWith('mailto:', i)) ||
-        (c === 'x' && s.startsWith('xmpp:', i));
-      if (isSchemeStart || (c === 'w' && s.startsWith('www.', i)) || !prevIsLocal) {
-        const bare = matchBareUrl(s, i, n, prevCh);
+      // Scheme start, case-insensitive (Https://, MAILTO:, ...).
+      const cl = c.toLowerCase();
+      const isSchemeStart = (cl === 'h' && /^(?:https?):\/\//i.test(s.slice(i, i + 8))) ||
+        (cl === 'f' && /^ftp:\/\//i.test(s.slice(i, i + 6))) ||
+        (cl === 'm' && /^mailto:/i.test(s.slice(i, i + 7))) ||
+        (cl === 'x' && /^xmpp:/i.test(s.slice(i, i + 5)));
+      if (!st.inLink && (isSchemeStart || (c === 'w' && s.startsWith('www.', i)) || !prevIsLocal)) {
+        // An '_' emphasis opener is currently open: a trailing '_' run
+        // after an email domain may be its closing delimiter.
+        let hasUnderscoreOpener = false;
+        for (let d = 0; d < delims.length; d++) {
+          const dd = delims[d];
+          if (dd.c === '_' && dd.open && dd.active) { hasUnderscoreOpener = true; break; }
+        }
+        const bare = matchBareUrl(s, i, n, prevCh, hasUnderscoreOpener);
         if (bare) {
           flushText(i);
           if (textMode) {
@@ -1244,7 +1283,14 @@ function isTableStart(lines, li) {
 
 // Does this line start a block that interrupts a paragraph?
 // (hr, ATX heading, blockquote, fences, list, html, table.)
-function interruptsParagraph(lines, li) {
+// `inList` is true when the paragraph lives inside a list item's
+// content. There, ANY ordered marker (1-9 digits) interrupts a
+// paragraph and starts a nested list (doc-01: `505791.` after a
+// paragraph inside an item becomes <ol start="505791">). At the top
+// level and inside a blockquote only a marker starting with 1
+// interrupts (probe: `foo\n505791. bar` stays one paragraph, as does
+// `> foo\n> 505791. bar`).
+function interruptsParagraph(lines, li, inList) {
   const line = lines[li];
   if (isBlankLine(line)) return true;
   let k = 0;
@@ -1261,12 +1307,12 @@ function interruptsParagraph(lines, li) {
   // Fences.
   if (/^(?:`{3,}|~{3,})/.test(rest)) return true;
   // List: a bullet interrupts a paragraph; an ordered marker interrupts
-  // only when it starts with 1. An EMPTY item (no content) cannot
-  // interrupt a paragraph.
+  // only when it starts with 1 (or any number inside a list item).
+  // An EMPTY item (no content) cannot interrupt a paragraph.
   if (/^(?:[*+-])[ \t]+[^ \t\n]/.test(rest)) return true;
   {
     const om = /^(?:(\d{1,9})[.)])[ \t]+[^ \t\n]/.exec(rest);
-    if (om && parseInt(om[1], 10) === 1) return true;
+    if (om && (inList || parseInt(om[1], 10) === 1)) return true;
   }
   // HTML block start.
   if (isHtmlBlockStart(line)) return true;
@@ -1289,7 +1335,7 @@ function isHr(line) {
 // (exclusive). Appends rendered strings and inline-item objects to `out`.
 // `refs` is the shared link-reference map (mutated by defs).
 // An inline item is {s, pre, post}: parse s inline, wrap with pre/post.
-function blockParse(lines, start, end, refs, out, isTop) {
+function blockParse(lines, start, end, refs, out, isTop, inList) {
   let i = start;
   // True when a blank line separates two top-level blocks in this range
   // (used for list looseness; blank lines inside a nested block do not
@@ -1504,7 +1550,7 @@ function blockParse(lines, start, end, refs, out, isTop) {
           const last = content.length > 0 ? content[content.length - 1] : null;
           const lastIsCode = last !== null && indentOf(last) >= 4;
           if (content.length > 0 && !isBlankLine(last) && !inFence && !lastIsCode &&
-              !interruptsParagraph(lines, j)) {
+              !interruptsParagraph(lines, j, inList)) {
             let stripped = l.replace(/^[ \t]+/, '');
             // A lazy setext underline is indented by 4 spaces so it is
             // paragraph text, not a heading underline (marked's
@@ -1533,7 +1579,7 @@ function blockParse(lines, start, end, refs, out, isTop) {
           if (lastIdx >= i && lastIdx < lines.length - 1) content.push('');
         }
         const inner = [];
-        blockParse(content, 0, content.length, refs, inner);
+        blockParse(content, 0, content.length, refs, inner, false, inList);
         // Defer rendering: a def defined later in the document may be
         // referenced by inline content inside the quote.
         out.push({ kind: 'blockquote', inner });
@@ -1578,8 +1624,12 @@ function blockParse(lines, start, end, refs, out, isTop) {
                 while (k < end && isBlankLine(lines[k])) k++;
                 if (k < end) {
                   const ni = matchListStart(lines[k]);
+                  // A marker is a new sibling item only when it is
+                  // less indented than our content; at content indent
+                  // or deeper it is nested content (doc-01).
                   if (ni && ni.ordered === ordered &&
-                      (ordered ? ni.delimiter === delimiter : ni.bullet === bullet)) {
+                      (ordered ? ni.delimiter === delimiter : ni.bullet === bullet) &&
+                      indentOf(lines[k]) < info.contentIndent) {
                     pendingBlank = true;
                     j = k;
                     break;
@@ -1618,7 +1668,7 @@ function blockParse(lines, start, end, refs, out, isTop) {
               {
                 const lastItemLine = itemLines.length > 0 ? itemLines[itemLines.length - 1] : null;
                 if (lastItemLine !== null && !isBlankLine(lastItemLine) &&
-                    !isBlankLine(cl) && !interruptsParagraph(lines, j) &&
+                    !isBlankLine(cl) && !interruptsParagraph(lines, j, inList) &&
                     !matchListStart(cl)) {
                   itemLines[itemLines.length - 1] = lastItemLine + '\n' + cl.replace(/^[ \t]+/, '');
                   j++;
@@ -1653,7 +1703,7 @@ function blockParse(lines, start, end, refs, out, isTop) {
         const parsedItems = [];
         for (const itemLines of items) {
           const inner = [];
-          if (blockParse(itemLines, 0, itemLines.length, refs, inner)) loose = true;
+          if (blockParse(itemLines, 0, itemLines.length, refs, inner, false, true)) loose = true;
           parsedItems.push(inner);
         }
         // Defer rendering for the same reason as the blockquote.
@@ -1696,7 +1746,7 @@ function blockParse(lines, start, end, refs, out, isTop) {
 
     // Setext heading: text lines + === or --- underline.
     {
-      const setext = matchSetext(lines, i, end);
+      const setext = matchSetext(lines, i, end, inList);
       if (setext) {
         out.push({ s: setext.text, pre: '<h' + setext.level + '>', post: '</h' + setext.level + '>\n' });
         i = setext.next;
@@ -1711,7 +1761,7 @@ function blockParse(lines, start, end, refs, out, isTop) {
       while (j < end) {
         const l = lines[j];
         if (isBlankLine(l)) break;
-        if (j > i && interruptsParagraph(lines, j)) break;
+        if (j > i && interruptsParagraph(lines, j, inList)) break;
         para.push(l);
         j++;
       }
@@ -1970,7 +2020,7 @@ function matchTable(lines, i, end) {
 }
 
 // Setext heading: text lines + === or --- underline.
-function matchSetext(lines, i, end) {
+function matchSetext(lines, i, end, inList) {
   const textLines = [];
   let j = i;
   while (j < end) {
@@ -1996,7 +2046,7 @@ function matchSetext(lines, i, end) {
     }
     // Otherwise it must be a plain text line: no block start, no 4+ indent.
     if (indentOf(l) >= 4) return null;
-    if (j > i && interruptsParagraph(lines, j)) return null;
+    if (j > i && interruptsParagraph(lines, j, inList)) return null;
     textLines.push(l);
     j++;
   }
