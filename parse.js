@@ -1223,6 +1223,23 @@ function stripIndent(line, n) {
   return ' '.repeat(spaces - n) + line.slice(k);
 }
 
+// Strip exactly 4 columns of indent for an indented code block line.
+// A tab that starts before column 4 always ends exactly at column 4,
+// so it is consumed whole; a tab starting at column 4 or later is
+// entirely beyond the indent and is preserved literally (doc-02:
+// `    \tindented` keeps its tab, it does not become 4 spaces).
+function stripCodeIndent(line) {
+  let col = 0;
+  let k = 0;
+  while (k < line.length && col < 4) {
+    const c = line.charCodeAt(k);
+    if (c === 32) { col++; k++; }
+    else if (c === 9) { col += 4 - (col % 4); k++; }
+    else break;
+  }
+  return line.slice(k);
+}
+
 // The block-tag list (CommonMark type 6): used for html blocks and for the
 // paragraph-interruption test.
 const BLOCK_TAGS = new Set(('address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h1|h2|h3|h4|h5|h6|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|meta|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul').split('|'));
@@ -1304,8 +1321,16 @@ function interruptsParagraph(lines, li, inList) {
   if (/^#{1,6}(?:[ \t]|$)/.test(rest)) return true;
   // Blockquote.
   if (rest[0] === '>') return true;
-  // Fences.
-  if (/^(?:`{3,}|~{3,})/.test(rest)) return true;
+  // Fences. A backtick fence's info string may not contain a
+  // backtick, so ```bar``` is inline code, not a fence, and does
+  // not interrupt a paragraph (doc-05).
+  {
+    const fm = /^(?:(`{3,})|(~{3,}))/.exec(rest);
+    if (fm) {
+      if (fm[2]) return true;
+      if (rest.slice(fm[1].length).indexOf('`') === -1) return true;
+    }
+  }
   // List: a bullet interrupts a paragraph; an ordered marker interrupts
   // only when it starts with 1 (or any number inside a list item).
   // An EMPTY item (no content) cannot interrupt a paragraph.
@@ -1370,14 +1395,14 @@ function blockParse(lines, start, end, refs, out, isTop, inList) {
             let k = j + 1;
             while (k < end && isBlankLine(lines[k])) k++;
             if (k < end && indentOf(lines[k]) >= 4) {
-              code.push(stripIndent(l, 4));
+              code.push(stripCodeIndent(l));
               j++;
               continue;
             }
             break;
           }
           if (indentOf(l) >= 4) {
-            code.push(stripIndent(l, 4));
+            code.push(stripCodeIndent(l));
             lastNonBlank = code.length - 1;
             lastCodeLine = j;
             j++;
@@ -1530,9 +1555,13 @@ function blockParse(lines, start, end, refs, out, isTop, inList) {
               else { const w = 4 - (col % 4); sp += w; col += w; t++; }
             }
             const cl = (sp >= 1 ? ' '.repeat(sp - 1) : '') + l.slice(t);
-            // Track fenced code blocks inside the quote.
+            // Track fenced code blocks inside the quote. A backtick
+            // fence opener's info string may not contain a backtick,
+            // so `` ```inner backticks``` `` is inline code, not a
+            // fence (doc-05) -- it must not set inFence, or the lazy
+            // lines that follow would wrongly end the quote.
             const fm = /^(?:`{3,}|~{3,})/.exec(cl);
-            if (fm) {
+            if (fm && !(fm[0][0] === '`' && cl.slice(fm[0].length).indexOf('`') !== -1)) {
               if (!inFence) inFence = fm[0][0];
               else if (fm[0][0] === inFence) inFence = null;
             }
@@ -1544,19 +1573,23 @@ function blockParse(lines, start, end, refs, out, isTop, inList) {
           // (the last content line is not blank), the line is not a
           // block start, and we are not inside a fenced code block or
           // an indented code block (lazy lines cannot continue code).
-          // The lazy line's leading whitespace is stripped and the text
-          // is merged into the previous content line, so it stays part
-          // of the paragraph (it cannot start a new block).
+          // The lazy line keeps its leading whitespace verbatim when
+          // indented < 4 (`> foo\n bar` -> `foo\n bar`), but at indent
+          // >= 4 the 4-column indented-code indent is stripped
+          // (`> foo\n    - bar` -> `foo\n- bar`, cm-238). It is merged
+          // into the previous content line, so it stays part of the
+          // paragraph (it cannot start a new block).
           const last = content.length > 0 ? content[content.length - 1] : null;
           const lastIsCode = last !== null && indentOf(last) >= 4;
           if (content.length > 0 && !isBlankLine(last) && !inFence && !lastIsCode &&
               !interruptsParagraph(lines, j, inList)) {
-            let stripped = l.replace(/^[ \t]+/, '');
+            const stripped = l.replace(/^[ \t]+/, '');
             // A lazy setext underline is indented by 4 spaces so it is
             // paragraph text, not a heading underline (marked's
             // blockquoteSetextReplace).
-            if (/^(?:=+|-+)[ \t]*$/.test(stripped)) stripped = '    ' + stripped;
-            content[content.length - 1] = last + '\n' + stripped;
+            const merged = /^(?:=+|-+)[ \t]*$/.test(stripped) ? '    ' + stripped :
+              (indentOf(l) >= 4 ? stripCodeIndent(l) : l);
+            content[content.length - 1] = last + '\n' + merged;
             j++;
             continue;
           }
@@ -1670,7 +1703,12 @@ function blockParse(lines, start, end, refs, out, isTop, inList) {
                 if (lastItemLine !== null && !isBlankLine(lastItemLine) &&
                     !isBlankLine(cl) && !interruptsParagraph(lines, j, inList) &&
                     !matchListStart(cl)) {
-                  itemLines[itemLines.length - 1] = lastItemLine + '\n' + cl.replace(/^[ \t]+/, '');
+                  // A lazy line keeps its leading whitespace verbatim
+                  // when indented < 4 (`- one\n two` -> `one\n two`),
+                  // but at indent >= 4 the 4-column indented-code
+                  // indent is stripped (`    - e` -> `- e`, cm-312).
+                  const lazyText = indentOf(cl) >= 4 ? stripCodeIndent(cl) : cl;
+                  itemLines[itemLines.length - 1] = lastItemLine + '\n' + lazyText;
                   j++;
                   continue;
                 }
@@ -1965,6 +2003,11 @@ function splitTableRow(line) {
 // lookahead excludes exactly these.
 function isTableBodyEnd(lines, li) {
   const line = lines[li];
+  // A whitespace-only line containing a tab is an empty table row,
+  // not a table end (doc-02: a `\t` line becomes a row of empty
+  // cells, and the table continues). A spaces-only line ends the
+  // table (the body loop breaks on /^ *$/ before reaching here).
+  if (isBlankLine(line) && line.indexOf('\t') !== -1) return false;
   if (indentOf(line) >= 4) return true;
   let k = 0;
   while (k < line.length && line[k] === ' ') k++;
@@ -2011,7 +2054,10 @@ function matchTable(lines, i, end) {
   let j = i + 2;
   while (j < end) {
     const l = lines[j];
-    if (isBlankLine(l)) break;
+    // A line of only spaces (or empty) ends the table, but a
+    // whitespace-only line containing a tab is an empty row
+    // (doc-02: `\t` -> row of empty cells; doc-05: `   ` ends it).
+    if (/^ *$/.test(l)) break;
     if (isTableBodyEnd(lines, j)) break;
     body.push(l);
     j++;
@@ -2058,16 +2104,19 @@ function matchSetext(lines, i, end, inList) {
 // blank lines, keeping at most one trailing newline.
 function finishHtmlBlock(lines, i, endLine, end, isTop) {
   // The html block is lines[i..endLine]. It carries a trailing \n
-  // exactly when the next line exists and is not a real blank line.
-  // A '' at the very end of the TOP-LEVEL range is the split artifact
-  // of a trailing newline (not a blank line), so it still gets a \n.
-  // (In a nested range the trailing '' is a synthetic separator, so
-  // it does not add a \n.)
+  // exactly when the next line exists and is not truly empty: a
+  // whitespace-only next line (e.g. doc-15's `\t` after `-->`)
+  // still counts (probe: `-->\n\t\nbar` -> `-->\n<p>bar</p>`),
+  // while a truly empty next line cancels it (`-->\n\nbar` ->
+  // `--><p>bar</p>`). A '' at the very end of the TOP-LEVEL range
+  // is the split artifact of a trailing newline (not a blank
+  // line), so it still gets a \n. (In a nested range the trailing
+  // '' is a synthetic separator, so it does not add a \n.)
   let text = lines.slice(i, endLine + 1).join('\n');
   const ni = endLine + 1;
   if (ni < end) {
-    if (!isBlankLine(lines[ni])) text += '\n';
-    else if (isTop && ni === end - 1 && lines[ni] === '') text += '\n';
+    if (lines[ni] !== '') text += '\n';
+    else if (isTop && ni === end - 1) text += '\n';
   }
   return { html: text, next: endLine + 1 };
 }
