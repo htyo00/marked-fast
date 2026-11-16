@@ -1,21 +1,27 @@
-// Driver for the marked-fast entry. The harness runs `node /bot/main.ts`.
-// It reads the case list, renders every case alone through parse() from
-// parse.js, and writes the HTML strings back in the same order.
-// Outside a container the MAKEFUN_INPUT_DIR / MAKEFUN_OUTPUT_DIR variables
-// stand in for /input and /output.
+// Driver for markdown-render-speed-02: reads every case from the input
+// directory, renders each one alone with parse() from parse.js, and writes
+// the HTML strings, in case order, as a JSON array to the output directory.
+// The harness runs this as `node /bot/main.ts` on Node 22 (type stripping,
+// so only erasable TypeScript syntax is used here). Outside a container the
+// MAKEFUN_INPUT_DIR / MAKEFUN_OUTPUT_DIR variables stand in for /input and
+// /output; when they are absent the container paths are used.
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from './parse.js';
 
-const inDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const inputDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
+const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-const raw = readFileSync(join(inDir, 'cases.json'), 'utf8');
-const list = JSON.parse(raw) as Array<{ id: string; markdown: string }>;
+const rawText = readFileSync(join(inputDir, 'cases.json'), 'utf8');
+const cases = JSON.parse(rawText) as { id: string; markdown: string }[];
 
-const rendered: string[] = new Array(list.length);
-for (let k = 0; k < list.length; k++) rendered[k] = parse(list[k].markdown);
+const rendered: string[] = new Array(cases.length);
+for (let i = 0; i < cases.length; i++) {
+  // Each case is rendered in isolation, exactly as the harness expects:
+  // no state is shared between cases.
+  rendered[i] = parse(cases[i].markdown);
+}
 
-mkdirSync(outDir, { recursive: true });
-writeFileSync(join(outDir, 'html.json'), JSON.stringify(rendered));
+mkdirSync(outputDir, { recursive: true });
+writeFileSync(join(outputDir, 'html.json'), JSON.stringify(rendered));
