@@ -1662,8 +1662,26 @@ function blockParse(lines, start, end, refs, out, isTop, inList) {
             // A lazy setext underline is indented by 4 spaces so it is
             // paragraph text, not a heading underline (marked's
             // blockquoteSetextReplace).
-            const merged = /^(?:=+|-+)[ \t]*$/.test(stripped) ? '    ' + stripped :
+            let merged = /^(?:=+|-+)[ \t]*$/.test(stripped) ? '    ' + stripped :
               (indentOf(l) >= 4 ? stripCodeIndent(l) : l);
+            // A lazy line at indent >= 4 is indented CODE in marked's
+            // inner parse, and a code block's text carries a trailing
+            // newline when a line follows it (fuzz Pola 3B, same as
+            // Pola 3A in lists): only the last of a run of such lines
+            // gets it, and only when the quote continues after it.
+            if (indentOf(l) >= 4 && !/^(?:=+|-+)[ \t]*$/.test(stripped)) {
+              const nx = lines[j + 1];
+              let nxIsQuote = false;
+              if (j + 1 < end && !isBlankLine(nx)) {
+                let k2 = 0;
+                while (k2 < nx.length && nx[k2] === ' ') k2++;
+                nxIsQuote = k2 <= 3 && nx[k2] === '>';
+              }
+              const nextIsCode = j + 1 < end && !isBlankLine(nx) && !nxIsQuote &&
+                indentOf(nx) >= 4 && !interruptsParagraph(lines, j + 1, inList);
+              const hasFollowing = j + 1 < end && !isBlankLine(nx);
+              if (!nextIsCode && hasFollowing) merged += '\n';
+            }
             content[content.length - 1] = last + '\n' + merged;
             j++;
             continue;
@@ -1782,7 +1800,32 @@ function blockParse(lines, start, end, refs, out, isTop, inList) {
                   // when indented < 4 (`- one\n two` -> `one\n two`),
                   // but at indent >= 4 the 4-column indented-code
                   // indent is stripped (`    - e` -> `- e`, cm-312).
-                  const lazyText = indentOf(cl) >= 4 ? stripCodeIndent(cl) : cl;
+                  // A lazy line at indent >= 4 is indented CODE in
+                  // marked's inner parse, and a code block's text
+                  // carries a trailing newline when a line follows it
+                  // (fuzz Pola 3A: the next line then joins with
+                  // another \n, giving the \n\n that splits the
+                  // paragraph). Consecutive code lines form ONE code
+                  // block, so only the last of a run gets it, and a
+                  // code line that is the item's last line gets none
+                  // (R1: no trailing \n, so no \n\n is produced).
+                  let lazyText = indentOf(cl) >= 4 ? stripCodeIndent(cl) : cl;
+                  if (indentOf(cl) >= 4) {
+                    const nx = lines[j + 1];
+                    // The next line continues the code run only if it
+                    // is itself a LAZY code line (indent < content
+                    // indent, >= 4); a regular content line (indent >=
+                    // content indent) is a separate item line, not
+                    // part of the run (P3A: `      update...` at
+                    // indent 6 >= base 5 is regular content).
+                    const nextIsCode = j + 1 < end && !isBlankLine(nx) &&
+                      indentOf(nx) >= 4 && indentOf(nx) < info.contentIndent &&
+                      !interruptsParagraph(lines, j + 1, inList) &&
+                      !matchListStart(nx) && !isFenceOpenerLine(nx);
+                    const hasFollowing = j + 1 < end && !isBlankLine(nx) &&
+                      !matchListStart(nx);
+                    if (!nextIsCode && hasFollowing) lazyText += '\n';
+                  }
                   itemLines[itemLines.length - 1] = lastItemLine + '\n' + lazyText;
                   j++;
                   continue;
@@ -1796,6 +1839,15 @@ function blockParse(lines, start, end, refs, out, isTop, inList) {
             while (itemLines.length > 1 && isBlankLine(itemLines[itemLines.length - 1])) {
               itemLines.pop();
               pendingBlank = true;
+            }
+            // Trailing spaces at the very end of the item are dropped
+            // (marked trimEnds the item text): `1. foo  ` renders
+            // `<li>foo</li>`, not `<li>foo  </li>` (fuzz Pola 2).
+            {
+              const last = itemLines[itemLines.length - 1];
+              if (last !== undefined && !isBlankLine(last)) {
+                itemLines[itemLines.length - 1] = last.replace(/[ \t]+$/, '');
+              }
             }
             // Preserve the trailing-newline info: if the item's last
             // content line is followed by a newline in the parent, append
@@ -1875,7 +1927,29 @@ function blockParse(lines, start, end, refs, out, isTop, inList) {
         const l = lines[j];
         if (isBlankLine(l)) break;
         if (j > i && interruptsParagraph(lines, j, inList)) break;
-        para.push(l);
+        // Inside a list item, a continuation line indented by 4+
+        // columns loses exactly 4 (marked's paragraph text: the
+        // list already stripped the content indent, and the inner
+        // parse drops the indented-code indent). At indent < 4 the
+        // whitespace is kept verbatim. Top-level paragraphs and
+        // top-level blockquotes keep their indent (fuzz Pola 1).
+        // A continuation line at indent >= 4 is indented CODE in
+        // marked's inner parse, and a code block's text carries a
+        // trailing newline when a line follows it (fuzz Pola 3A):
+        // only the last line of a run of such lines gets the
+        // trailing \n, and only when the paragraph continues after
+        // it (a code line that is the paragraph's last line gets
+        // none, R1).
+        if (j > i && inList && indentOf(l) >= 4) {
+          let t = stripCodeIndent(l);
+          const nx = lines[j + 1];
+          const nextIsCode = j + 1 < end && !isBlankLine(nx) &&
+            indentOf(nx) >= 4 && !interruptsParagraph(lines, j + 1, inList);
+          const continues = j + 1 < end && !isBlankLine(nx) &&
+            !interruptsParagraph(lines, j + 1, inList);
+          if (!nextIsCode && continues) t += '\n';
+          para.push(t);
+        } else para.push(l);
         j++;
       }
       out.push({ s: para.join('\n'), pre: '<p>', post: '</p>\n' });
